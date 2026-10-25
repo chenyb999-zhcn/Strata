@@ -9,12 +9,18 @@
 #include <cstring>
 #else
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
+#include <mutex>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 #endif
 
 namespace strata::platform {
@@ -160,6 +166,9 @@ uint64_t total_physical_memory() {
 bool read_ahead_enabled() { return false; }
 void advise_willneed(const void*, uint64_t) {}
 void advise_willneed(int, uint64_t, uint64_t) {}
+void populate_read(const MappedRange*, unsigned, unsigned) {}
+void populate_read(const void*, uint64_t, unsigned) {}
+bool read_range_direct(const std::string&, uint64_t, uint64_t, void*, unsigned, unsigned) { return false; }
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -199,7 +208,11 @@ uint64_t total_physical_memory() {
 }
 
 namespace {
-constexpr uint64_t kAdviseStep = 128ull << 10;
+// A read-ahead advise is asynchronous but each call only queues one window, and the consumer
+// waits for it: 128 KiB steps made a 3.6 GiB startup load queue ~29k windows one after another
+// (60 MB/s on an NVMe that does 1.4 GB/s with a deep queue).  Ask for 4 MiB at a time instead:
+// the window cap still applies per call, but the calls no longer serialize the load.
+constexpr uint64_t kAdviseStep = 4ull << 20;
 }
 
 bool read_ahead_enabled() {
@@ -230,6 +243,53 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
 #endif
 }
+
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22   // Linux 5.14; a build host without the header definition still gets the advise
+#endif
+
+void populate_read(const void* p, uint64_t bytes, unsigned threads) {
+    const MappedRange one{p, bytes};
+    populate_read(&one, 1, threads);
+}
+
+void populate_read(const MappedRange* ranges, unsigned count, unsigned threads) {
+    if (ranges == nullptr || count == 0) return;
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    const uintptr_t page = ps > 0 ? (uintptr_t) ps : 4096;
+    // Probe one page first: a kernel without the advice fails at once, and a hint is all that is left.
+    uintptr_t first = 0;
+    for (unsigned i = 0; i < count && first == 0; ++i)
+        if (ranges[i].p != nullptr && ranges[i].bytes != 0) first = ((uintptr_t) ranges[i].p) & ~(page - 1);
+    if (first == 0) return;
+    if (madvise((void*) first, (size_t) page, MADV_POPULATE_READ) != 0) {
+        for (unsigned i = 0; i < count; ++i) advise_willneed(ranges[i].p, ranges[i].bytes);
+        return;
+    }
+    constexpr uintptr_t kPiece = 256ull << 20;
+    std::vector<std::pair<uintptr_t, uintptr_t>> work;
+    for (unsigned i = 0; i < count; ++i) {
+        if (ranges[i].p == nullptr || ranges[i].bytes == 0) continue;
+        const uintptr_t a = ((uintptr_t) ranges[i].p) & ~(page - 1);
+        const uintptr_t b = (uintptr_t) ranges[i].p + (uintptr_t) ranges[i].bytes;
+        for (uintptr_t at = a; at < b; at += kPiece) work.emplace_back(at, std::min(b, at + kPiece));
+    }
+    if (work.empty()) return;
+    std::atomic<unsigned> next{0};
+    auto run = [&] {
+        for (unsigned i; (i = next.fetch_add(1)) < (unsigned) work.size();) {
+            const uintptr_t a = work[i].first, b = work[i].second;
+            (void) madvise((void*) a, (size_t) (b - a), MADV_WILLNEED);        // queue this piece's read-ahead
+            (void) madvise((void*) a, (size_t) (b - a), MADV_POPULATE_READ);    // and fault it in
+        }
+    };
+    unsigned n = threads < 1 ? 1u : threads;
+    if (n > (unsigned) work.size()) n = (unsigned) work.size();
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < n; ++t) pool.emplace_back(run);
+    run();
+    for (auto& t : pool) t.join();
+}
 #endif
 
 ProcIo proc_io_sample() {
@@ -258,3 +318,53 @@ ProcIo proc_io_sample() {
 }
 
 }  // namespace strata::platform
+
+#if !defined(_WIN32)
+namespace strata::platform {
+namespace {
+// One O_DIRECT fd per model file, kept for the life of the process: the dense loader asks for one tensor at a
+// time (495 of them on the shard of #4064), and an open/close pair per tensor cost more than the read itself.
+std::mutex g_direct_mu;
+std::map<std::string, int> g_direct_fds;
+int direct_fd(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_direct_mu);
+    auto it = g_direct_fds.find(path);
+    if (it != g_direct_fds.end()) return it->second;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd >= 0) g_direct_fds.emplace(path, fd);
+    return fd;
+}
+}  // namespace
+
+bool read_range_direct(const std::string& path, uint64_t off, uint64_t len, void* dst, unsigned threads,
+                       unsigned req_bytes) {
+    if (len == 0) return true;
+    if (dst == nullptr || (off % 512) != 0 || (len % 512) != 0 || (((uintptr_t) dst) % 512) != 0) return false;
+    const int fd = direct_fd(path);
+    if (fd < 0) return false;
+    const uint64_t req = req_bytes < 4096 ? 4096 : req_bytes;
+    std::atomic<uint64_t> next{0};
+    std::atomic<bool> ok{true};
+    auto run = [&] {
+        for (uint64_t at; (at = next.fetch_add(req)) < len;) {
+            const uint64_t n = len - at < req ? len - at : req;
+            uint8_t* p = (uint8_t*) dst + at;
+            uint64_t done = 0;
+            while (done < n) {
+                const ssize_t got = ::pread(fd, p + done, (size_t) (n - done), (off_t) (off + at + done));
+                if (got <= 0) { ok.store(false); return; }
+                done += (uint64_t) got;
+            }
+        }
+    };
+    const uint64_t requests = (len + req - 1) / req;
+    unsigned n = threads < 1 ? 1u : threads;
+    if ((uint64_t) n > requests) n = (unsigned) requests;
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < n; ++t) pool.emplace_back(run);
+    run();
+    for (auto& th : pool) th.join();
+    return ok.load();
+}
+}   // namespace strata::platform
+#endif

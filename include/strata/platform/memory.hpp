@@ -85,6 +85,25 @@ void advise_willneed(const void* p, uint64_t bytes);
 /// The same for [offset, offset + bytes) of an open file.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
 
+/// A mapped range to fault in, so a loader can hand over every tensor it is about to copy at once.
+struct MappedRange {
+    const void* p;
+    uint64_t bytes;
+};
+/// Faults mapped ranges in from the kernel side (MADV_POPULATE_READ, Linux 5.14+) in contiguous 256 MiB pieces
+/// over `threads` workers, queueing each piece's read-ahead first.  A plain copy out of the mapping pays one 4 KiB
+/// fault per page from one thread (60 MB/s measured on a cold 3.6 GiB projection load, against 1.4 GB/s for the
+/// same drive with a deep queue); contiguous pieces over a few workers keep several page-in streams in flight.
+/// Without the advice (older kernels) it degrades to a read-ahead hint.  No-op on Windows.
+void populate_read(const MappedRange* ranges, unsigned count, unsigned threads = 8);
+void populate_read(const void* p, uint64_t bytes, unsigned threads = 8);
+
+/// Reads [off, off + len) of `path` into `dst` with O_DIRECT, `threads` workers of `req_bytes` each.
+/// `off` and `len` must be multiples of 512 and `dst` 512-byte aligned (an anonymous mapping is).  Returns
+/// false when the file cannot be opened unbuffered, so a caller can fall back to the page cache.
+bool read_range_direct(const std::string& path, uint64_t off, uint64_t len, void* dst, unsigned threads,
+                       unsigned req_bytes = 4u << 20);
+
 /// What the OS says this process read from storage: `read_bytes` (/proc/self/io: bytes fetched from the block layer on
 /// its behalf, page faults on a mapping included, page-cache hits not) and `major_faults` (/proc/self/stat).  Linux
 /// only; `valid` is false elsewhere.  Take one at the start of a request and one at its end.

@@ -124,11 +124,25 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
     if (STRATA_FILE_SEEK64(f, 0, SEEK_END) != 0) return false;
     const long long n = (long long) STRATA_FILE_TELL64(f);
     if (n < 0 || STRATA_FILE_SEEK64(f, 0, SEEK_SET) != 0) return false;
-#if !defined(_WIN32)
-    strata::platform::advise_willneed(fileno(f), 0, (uint64_t) n);
-#endif
+    if (n == 0) return true;
+    // The drafter's files are cold at startup and `fread` on a cold page cache delivers ~58 MB/s (835 MiB in
+    // 13.6 s measured on the box of #4064): read them unbuffered instead, through a 512-byte aligned window in
+    // the same vector, and slide the bytes into place.  Falls back to `fread` when O_DIRECT is unavailable.
+    {
+        const uint64_t need = (uint64_t) n, tail = (512 - (need % 512)) % 512;
+        out.resize((size_t) (need + tail + 512));
+        uint8_t* base = out.data();
+        uint8_t* aligned = (uint8_t*) (((uintptr_t) base + 511) & ~(uintptr_t) 511);
+        const uint64_t read_len = need + tail;
+        if (strata::platform::read_range_direct(path, 0, read_len, aligned, 8)) {
+            if (aligned != base) std::memmove(base, aligned, (size_t) need);
+            out.resize((size_t) need);
+            return true;
+        }
+    }
     out.resize((size_t) n);
-    return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
+    if (STRATA_FILE_SEEK64(f, 0, SEEK_SET) != 0) return false;
+    return std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
 
 }  // namespace

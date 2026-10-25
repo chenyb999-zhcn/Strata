@@ -311,6 +311,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // Validate every directory span, including tensors we do not upload:
             // an ignored tensor must not overlap the native matrix that follows it.
             const uint64_t payload = gguf.file_size() - gguf.data_start();
+            uint64_t max_tensor_bytes = 0;   // for the staging buffer the uploads below read through
             for (const auto& tensor : gguf.tensors()) {
                 int block_elements = 0, block_bytes = 0;
                 uint64_t elements = 1;
@@ -332,14 +333,23 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (tensor.offset > payload || bytes > payload - tensor.offset) {
                     err = "native dense: truncated payload " + tensor.name; return false;
                 }
+                max_tensor_bytes = (std::max)(max_tensor_bytes, bytes);
                 const auto next = std::upper_bound(offsets.begin(), offsets.end(), tensor.offset);
                 if (next != offsets.end() && bytes > *next - tensor.offset) {
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
-                // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
-                    strata::kernels::native_mmvq_supported(tensor.type))
-                    strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
+                // (the uploads below read through the staging buffer allocated after this pass)
+            }
+            // A page-aligned staging buffer, one tensor at a time: a copy out of the mapping faults the file's
+            // pages in 4 KiB at a time (~60 MB/s cold), while the unbuffered read of the same bytes with 4 MiB
+            // requests over a few workers reaches the drive (940 MB/s-1.4 GB/s here).  Allocated once, reused.
+            std::vector<uint8_t> stage_raw;
+            uint8_t* stage = nullptr;
+            uint64_t stage_bytes = 0;
+            if (max_tensor_bytes > 0) {
+                stage_bytes = max_tensor_bytes + 8192;                  // + one page of alignment slack
+                stage_raw.assign((size_t) stage_bytes + 4096, 0);
+                stage = (uint8_t*) (((uintptr_t) stage_raw.data() + 4095) & ~(uintptr_t) 4095);
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
@@ -366,8 +376,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
+                const uint8_t* src = gguf.tensor_data(tensor);
+                if (status == cudaSuccess && stage != nullptr) {
+                    const uint64_t off = gguf.data_start() + tensor.offset;
+                    const uint64_t lead = off & 4095;                       // O_DIRECT: 512-byte aligned file offset
+                    const uint64_t read_len = (lead + bytes + 511) / 512 * 512;
+                    if (lead + read_len <= stage_bytes &&
+                        strata::platform::read_range_direct(gguf.path(), off - lead, read_len, stage, 8))
+                        src = stage + lead;
+                }
                 if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                    status = cudaMemcpy(data.get(), src, bytes, cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -412,9 +431,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     void* p = nullptr;
                     std::vector<uint8_t> q8;
                     if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    const void* hc_src = f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor);
+                    if (!f32_inject && stage != nullptr) {   // read it instead of faulting the mapping in
+                        const uint64_t off = gguf.data_start() + tensor.offset;
+                        const uint64_t lead = off & 4095;
+                        const uint64_t read_len = (lead + bytes + 511) / 512 * 512;
+                        if (lead + read_len <= stage_bytes &&
+                            strata::platform::read_range_direct(gguf.path(), off - lead, read_len, stage, 8))
+                            hc_src = stage + lead;
+                    }
                     if (cudaMalloc(&p, bytes) != cudaSuccess ||
-                        cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
-                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        cudaMemcpy(p, hc_src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
                     ref.hc_q8 = p;
