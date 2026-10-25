@@ -377,7 +377,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
                 const uint8_t* src = gguf.tensor_data(tensor);
-                if (status == cudaSuccess && stage != nullptr) {
+                const bool cached = strata::platform::resident_fraction(src, bytes) >= 0.9;
+                if (status == cudaSuccess && stage != nullptr && !cached) {
                     const uint64_t off = gguf.data_start() + tensor.offset;
                     const uint64_t lead = off & 4095;                       // O_DIRECT: 512-byte aligned file offset
                     const uint64_t read_len = (lead + bytes + 511) / 512 * 512;

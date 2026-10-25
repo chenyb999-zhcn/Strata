@@ -337,10 +337,26 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         strata::platform::advise_willneed(fileno(f), 0, bytes);
 #endif
         std::vector<uint8_t> chunk(64u << 20);
+        // Same reason as read_file above: 675 MiB of experts through `fread` on a cold page cache is ~58 MB/s
+        // (14 s measured on the box of #4064).  Read them unbuffered into a 512-byte aligned window and slide
+        // them over; a chunk that cannot be read that way falls back to `fread` from the same offset.
+        std::vector<uint8_t> stage(chunk.size() + 512);
+        uint8_t* direct_dst = (uint8_t*) (((uintptr_t) stage.data() + 511) & ~(uintptr_t) 511);
+        const std::string experts_path = rt_dir + "/experts.bin";
+        bool direct_ok = true;
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            const uint64_t aligned_n = (n + 511) / 512 * 512;
+            const uint8_t* from = chunk.data();
+            if (direct_ok && aligned_n <= stage.size() &&
+                strata::platform::read_range_direct(experts_path, off, aligned_n, direct_dst, 8)) {
+                from = direct_dst;
+            } else {
+                direct_ok = false;
+                if (STRATA_FILE_SEEK64(f, (long long) off, SEEK_SET) != 0) { err = "mtp: experts.bin seek"; return false; }
+                if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
+            }
+            cudaMemcpy(experts_ + off, from, n, cudaMemcpyHostToDevice);
             off += n;
         }
         vram_ += bytes;

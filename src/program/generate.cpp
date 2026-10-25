@@ -2355,6 +2355,16 @@ void parallel_profile_fill(const std::vector<ProfileFillJob>& jobs, strata::core
 {
     filled = 0; bytes = 0; bad = -1;
     if (jobs.empty()) return;
+    // Fetch the pairs in file order, not profile order: the profile is ranked by routing frequency, which turns
+    // the fill into a random walk over the two 49 GiB shards - the pattern a DRAM-less QLC drive (40 MiB mapping
+    // buffer) handles worst, and this box repeatedly collapsed to 50-280 MB/s for minutes during it.  The same
+    // pairs in (layer, expert) order are monotonic in the file; the slot assignments are unchanged.
+    std::vector<size_t> order(jobs.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (jobs[a].layer != jobs[b].layer) return jobs[a].layer < jobs[b].layer;
+        return jobs[a].expert < jobs[b].expert;
+    });
     std::atomic<size_t> next{0};
     std::atomic<int64_t> done{0};
     std::atomic<uint64_t> copied{0};
@@ -2366,8 +2376,8 @@ void parallel_profile_fill(const std::vector<ProfileFillJob>& jobs, strata::core
         if (device >= 0) on.reset(new strata::core::OnDevice(device));
         while (!failed.load(std::memory_order_relaxed)) {
             const size_t k = next.fetch_add(1);
-            if (k >= jobs.size()) break;
-            const ProfileFillJob& j = jobs[k];
+            if (k >= order.size()) break;
+            const ProfileFillJob& j = jobs[order[k]];
             std::string e;
             const uint8_t* b = src.blob_stable(j.layer, j.expert);
             if (b == nullptr || !cache.fill_slot_blocking(j.slot, b, e, j.bytes)) {

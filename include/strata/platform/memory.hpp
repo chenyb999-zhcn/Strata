@@ -104,6 +104,11 @@ void populate_read(const void* p, uint64_t bytes, unsigned threads = 8);
 bool read_range_direct(const std::string& path, uint64_t off, uint64_t len, void* dst, unsigned threads,
                        unsigned req_bytes = 4u << 20);
 
+/// How much of [p, p + bytes) is already in the page cache, 0.0-1.0, sampled one page per MiB (mincore).
+/// Lets a loader take the cheap path on a warm start (a copy out of the mapping) and the unbuffered one when
+/// the bytes really are on the drive.  1.0 on platforms without mincore, so callers keep their old behaviour.
+double resident_fraction(const void* p, uint64_t bytes);
+
 /// What the OS says this process read from storage: `read_bytes` (/proc/self/io: bytes fetched from the block layer on
 /// its behalf, page faults on a mapping included, page-cache hits not) and `major_faults` (/proc/self/stat).  Linux
 /// only; `valid` is false elsewhere.  Take one at the start of a request and one at its end.

@@ -169,6 +169,7 @@ void advise_willneed(int, uint64_t, uint64_t) {}
 void populate_read(const MappedRange*, unsigned, unsigned) {}
 void populate_read(const void*, uint64_t, unsigned) {}
 bool read_range_direct(const std::string&, uint64_t, uint64_t, void*, unsigned, unsigned) { return false; }
+double resident_fraction(const void*, uint64_t) { return 1.0; }   // no mincore: keep the caller's default path
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -365,6 +366,19 @@ bool read_range_direct(const std::string& path, uint64_t off, uint64_t len, void
     run();
     for (auto& th : pool) th.join();
     return ok.load();
+}
+double resident_fraction(const void* p, uint64_t bytes) {
+    if (p == nullptr || bytes == 0) return 0.0;
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    const uint64_t page = ps > 0 ? (uint64_t) ps : 4096;
+    const uint64_t pages = (bytes + page - 1) / page;
+    std::vector<unsigned char> vec((size_t) ((pages + 7) / 8), 0);
+    if (mincore((void*) p, (size_t) bytes, vec.data()) != 0) return 0.0;
+    const uint64_t step_pages = (1ull << 20) / page;      // one sample per MiB
+    uint64_t seen = 0, hit = 0;
+    for (uint64_t i = 0; i < pages; i += step_pages, ++seen)
+        if (vec[(size_t) (i / 8)] & (1u << (i % 8))) ++hit;
+    return seen == 0 ? 0.0 : (double) hit / (double) seen;
 }
 }   // namespace strata::platform
 #endif
